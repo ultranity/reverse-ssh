@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo $*;killall -0 rssh 2>/dev/null || (rssh -b 33333)
